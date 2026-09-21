@@ -1,9 +1,9 @@
 # CS 457 Project Statement of Work (SOW) & Protocol Specification Template
 
-**Student Name:** [Your Full Name]  
-**Date:** [YYYY-MM-DD]  
+**Student Name:** Kyler Hixon
+**Date:** 2026-09-20  
 **Course:** CS 457 - Computer Networks  
-**Target Server Domain:** `server.[yourlastname].edu`  
+**Target Server Domain:** `server.hixon.edu`  
 
 ---
 
@@ -17,14 +17,14 @@
 > - You are encouraged to use python, but I'm not going to make it a strict requirement. The instructor and TA's ability to help with C or Rust, etc will be diminished in other languages.
 
 ### 1.1 Game Overview
-- **Chosen Game:** [e.g., Terminal Trivia, Tic-Tac-Toe, Connect Four, Battleship]
+- **Chosen Game:** 5 card Poker
 - **Player Capacity:** 2 Players (Simulated via 2 CML Client nodes)
-- **Game Summary:** [Briefly describe the gameplay mechanics and rules]
+- **Game Summary:** The game will consist of players who will be able to connect to an online poker game that follows traditional 5 card draw rules. the rules will come directly from https://www.pokerology.com/poker/rules/five-card-draw/ (this means there is 5 game actions that would correlate to a traditional game) all actions will be performed in the terminal, and cards will be represented by an integer followed by an ASCII symbol for the card suite.
 
 ### 1.2 Core Game Rules & Win/Draw Conditions
-- **Turn Mechanics:** [Explain how turn order is enforced between Player 1 and Player 2]
-- **Victory Condition:** [Define how a player wins the game]
-- **Draw/Tie Condition:** [Define how a draw/tie is detected and handled]
+- **Turn Mechanics:** The number of wins will determine who goes first. Upon initial connection there will be a 50/50 chance of P1 going first, and for every round won by a player, their odds of being first decreases by 10%. With going first having an informational advantage this keeps the flow of the game more fair. 
+- **Victory Condition:** A player wins the entire game upon 3 consecutive wins over the other player, or the other player forefiting.
+- **Draw/Tie Condition:** If neither player concedes or can win 3 games in a row, the game will end after 10 rounds of poker (or 15 that can be decided when making the lobby initially) and neither player wins or loses.
 
 ---
 
