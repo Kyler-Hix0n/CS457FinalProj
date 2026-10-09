@@ -202,6 +202,7 @@ def hand_name(score):
     """
 
     names = {
+        #temp add royal flush later -- 10: "Royal Flush",
         9: "Straight Flush",
         8: "Four of a Kind",
         7: "Full House",

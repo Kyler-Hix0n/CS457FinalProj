@@ -19,6 +19,9 @@ SERVER_HOST = "127.0.0.1"
 # SERVER_HOST = "192.168.20.100"
 
 PORT = 5050
+#PORT = 5000 mac no like
+
+SPACER = "==================="
 
 
 # ------------------------------------------------------
@@ -83,20 +86,9 @@ def send_action(action, **kwargs):
         "action": action
     }
 
-    payload.update(
-        kwargs
-    )
-
-    message = create_message(
-        "ACTION",
-        player_id,
-        payload
-    )
-
-    send_message(
-        sock,
-        message
-    )
+    payload.update(kwargs)
+    message = create_message("ACTION", player_id, payload)
+    send_message(sock,message)
 
 
 # -------------------------------------------------------
@@ -255,22 +247,11 @@ def handle_message(message):
             "your_role"
         ]
 
-        print(
-            "\n===================="
-        )
+        print("\n" + SPACER)
 
-        print(
-            "GAME START"
-        )
-
-        print(
-            "===================="
-        )
-
-        print(
-            "You are:",
-            player_id
-        )
+        print("GAME START")
+        print(SPACER)
+        print("You are:",player_id)
 
         print(
             "First player:",
@@ -357,17 +338,9 @@ def handle_message(message):
 
     elif msg_type == "ROUND_OVER":
 
-        print(
-            "\n===================="
-        )
-
-        print(
-            "ROUND OVER"
-        )
-
-        print(
-            "===================="
-        )
+        print("\n" + SPACER)
+        print("ROUND OVER")
+        print(SPACER)
 
         if payload["winner"] is None:
 
