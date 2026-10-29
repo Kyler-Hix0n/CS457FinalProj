@@ -245,14 +245,14 @@ The lock is held while sending, so a peer that stops reading could block `sendal
 | R1 | Both players submit `ACTION` at the same instant | Both read `active_player == Player_1` before either switches. Two moves are applied for one turn. | CS-3 serializes them. The second worker sees the updated `active_player` and gets `ERROR OUT_OF_TURN`, or its move is valid if the turn has really passed to it. |
 | R2 | Player 1 sends `DRAW` twice in quick succession | Two concurrent `deck.pop()` sequences | Both messages come from the same worker, so they are handled one after the other. The second sees `active_player == Player_2` and is rejected. |
 | R3 | A disconnect while the other worker is broadcasting | `players` changes size while being iterated, or a send goes to a closed socket | CS-5 cannot start until CS-3 releases the lock. The broadcast also iterates over a `list()` snapshot. |
-| R4 | EOF and a broadcast send failure both detect the same dead player | Two forfeits and two `GAME_OVER` messages | The `if player_id not in players: return` guard runs under the lock, so only the first detection does anything. |
+| R4 | EOF and a broadcast send failure both detect the same dead player | The departure is handled twice: two `PLAYER_DISCONNECTED` notices, or two forfeits and two `GAME_OVER` messages | The `if players.get(player_id) is not sock: return` guard runs under the lock, so only the first detection does anything. |
 | R5 | `ERROR` to Player 1 from its own worker while Player 2's worker broadcasts `STATE_UPDATE` to Player 1 | Interleaved bytes produce a corrupt JSON line on Player 1's socket | Rule 3: every send runs under `game_lock`, so the frames on one socket stay whole. |
 | R6 | A player's `ACTION` arrives before `start_game` finishes | The action runs against a half-dealt game | Its worker blocks on the lock until CS-2 is finished, then sees `state == PLAYER_TURN`. |
 | R7 | Two clients send `CONNECT` at the same time | Two sockets assigned `Player_2` | Each join is handled under CS-1, so the capacity check and the insert into `players` are atomic. |
 | R9 | A dropped player reconnects before their old worker has finished cleanup | The old worker's `finally` removes the **new** socket, and the player is dropped again | The guard compares sockets (`players.get(player_id) is not sock`), so the stale worker's cleanup does nothing. |
 | R10 | A player reconnects in the same second their deadline expires | Reseated and forfeited at once | The join (CS-1) and `expire_reconnects` (CS-7) both run under `game_lock`. Whichever runs first removes the deadline, so the other sees a consistent result. |
 | R11 | The opponent acts while the seat is empty | A move is applied that the missing player never sees, or a broadcast is skipped | `handle_action` checks `len(players) < 2` under the lock and answers `ERROR GAME_PAUSED` without changing state. |
-| R8 | A disconnect lands between `ROUND_OVER` and the next deal | A hand is dealt to a departed player | `send_hand` checks `player_id in players` under the same lock. The forfeit path sets `GAME_OVER`, and all later actions are rejected. |
+| R8 | A disconnect lands between `ROUND_OVER` and the next deal | A hand is sent to a closed socket | `send_hand` skips players who aren't in `players`. The new hand stays in the saved game, and the player receives it on reconnect. Until then every `ACTION` gets `GAME_PAUSED`. |
 
 ## 6. Turn Enforcement & Move Validation
 
@@ -278,7 +278,7 @@ The lock is held while sending, so a peer that stops reading could block `sendal
 2. **All or nothing before the next change.** The broadcast loop sends to every connected player **before** `game_lock` is released. No later move can be applied, and no other message sent, until both clients have the update in their TCP send buffers.
 3. **Same order for both clients.** Every send happens under one lock and TCP keeps the byte order on each connection, so both clients see the message sequence (`STATE_UPDATE` → `ROUND_OVER` → `HAND` → `STATE_UPDATE` …) in the same relative order.
 4. **Private data stays private.** `HAND` is sent with `send_message(players[pid], …)` to its owner only and is never passed to `broadcast`. `public_state()` contains no cards.
-5. **Failure isolation.** If the send to one client fails, that client goes through the disconnect and forfeit path. The other client still gets the broadcast, followed by `GAME_OVER {reason: FORFEIT}`.
+5. **Failure isolation.** If the send to one client fails, that client goes through the disconnect path: the game is paused and their seat is held for a reconnect. The other client still gets the broadcast, followed by `PLAYER_DISCONNECTED`.
 6. **Ordering check.** Every `STATE_UPDATE` carries a `seq` counter that is incremented under the lock. The client prints a warning if it ever sees a gap.
 
 ## 8. Score & Leaderboard Synchronization
@@ -322,241 +322,129 @@ The score change and both broadcasts happen under the same lock acquisition, so 
 
 ## 9. State & Score Broadcast Sequence Diagram
 
-The diagram shows every protocol message the game uses: `CONNECT`, `LOBBY_WAIT`, `GAME_START`, `HAND`, `ACTION` (`DRAW`, `CHECK`, `BET`, `CALL`, `ALL_IN`, `FOLD`), `STATE_UPDATE`, `ERROR`, `ROUND_OVER`, `PLAYER_DISCONNECTED`, `PLAYER_RECONNECTED`, `GAME_OVER`, and `DISCONNECT`. It also shows which thread holds `game_lock`.
+The diagram shows every protocol message the game uses: `CONNECT`, `LOBBY_WAIT`, `GAME_START`, `HAND`, `ACTION` (`CHECK`, `BET`, `CALL`, `ALL_IN`, `FOLD`, `DRAW`), `STATE_UPDATE`, `ERROR`, `ROUND_OVER`, `PLAYER_DISCONNECTED`, `PLAYER_RECONNECTED`, `GAME_OVER`, and `DISCONNECT`.
+
+To keep it readable, the server is drawn as one participant. Internally, each message is handled by the worker thread of the client that sent it, and every server step shown runs inside one `game_lock` critical section (Sections 3 and 5). The round uses the real phase order: `BETTING_1` → `DRAW_PHASE` → `BETTING_2` → showdown, with `Player_1` acting first.
 
 ```mermaid
 sequenceDiagram
     autonumber
     actor C1 as Client 1 (Player_1)
-    participant W1 as Worker Thread 1
-    participant M as Main Thread
-    participant GS as Shared State (game_lock)
-    participant W2 as Worker Thread 2
+    participant S as Server
     actor C2 as Client 2 (Player_2)
-    participant W3 as Worker Thread 3 (later connections)
-    actor C3 as Client 3 (extra)
 
-    Note over C1,C3: Phase 1 - Connection, joining, waiting to join
-
-    C1->>M: TCP connect (accept returns sock1)
-    M->>W1: spawn Thread(handle_client, sock1)
-    C1->>W1: CONNECT (name Alex)
-    critical W1 holds game_lock
-        W1->>GS: lobby has a free seat, name not taken
-        W1->>GS: players[Player_1] = sock1, identities[Player_1] = (Alex, IP 1)
-        W1-->>C1: LOBBY_WAIT (players_connected 1, players_required 2)
-    end
-
-    C2->>M: TCP connect (accept returns sock2)
-    M->>W2: spawn Thread(handle_client, sock2)
-    C2->>W2: CONNECT (name Blake)
-    critical W2 holds game_lock
-        W2->>GS: players[Player_2] = sock2, identities[Player_2] = (Blake, IP 2)
-        W2-->>C2: LOBBY_WAIT (players_connected 2, players_required 2)
-    end
-
-    Note over W2,GS: Two players joined - game starts
-    critical W2 holds game_lock (W1 blocks on any ACTION)
-        W2->>GS: start_game() shuffle, deal, pick first_player, 100 chips each
-        par GAME_START to both
-            W2-->>C1: GAME_START (your_role Player_1, first_player Player_1, round 1, starting_chips 100)
-        and
-            W2-->>C2: GAME_START (your_role Player_2, first_player Player_1, round 1, starting_chips 100)
-        end
-        W2-->>C1: HAND (Player_1 cards only - private)
-        W2-->>C2: HAND (Player_2 cards only - private)
-        par STATE_UPDATE broadcast
-            W2-->>C1: STATE_UPDATE (round 1, active Player_1, chips 100-100, last_action GAME_START)
-        and
-            W2-->>C2: STATE_UPDATE (round 1, active Player_1, chips 100-100, last_action GAME_START)
-        end
-    end
-
-    C3->>M: TCP connect (accept returns sock3)
-    M->>W3: spawn Thread(handle_client, sock3)
-    C3->>W3: CONNECT (name Casey)
-    critical W3 holds game_lock
-        W3->>GS: match running, no seat held for a reconnect
-        W3-->>C3: ERROR (code GAME_FULL)
-    end
-    W3->>C3: close sock3
-
-    Note over C1,C2: Phase 2 - Concurrent moves, turn enforcement, validation
-
-    par Both clients send at the same instant
-        C1->>W1: ACTION (DRAW, cards 1 and 3)
+    Note over C1,C2: Lobby - waiting to join, then joined
+    C1->>S: CONNECT (name Alex)
+    S-->>C1: LOBBY_WAIT (1 of 2 players)
+    C2->>S: CONNECT (name Blake)
+    S-->>C2: LOBBY_WAIT (2 of 2 players)
+    Note over S: Shuffle, deal, pick first player, 100 chips each
+    par Game start to both
+        S-->>C1: GAME_START (your_role Player_1)
     and
-        C2->>W2: ACTION (CHECK)
+        S-->>C2: GAME_START (your_role Player_2)
     end
-    Note over W1,W2: Both workers parse and schema-check OUTSIDE the lock<br/>then race to acquire game_lock
-
-    critical W2 acquires game_lock first (W1 blocks)
-        W2->>GS: state PLAYER_TURN? yes. active_player == Player_2? NO
-        W2-->>C2: ERROR (code OUT_OF_TURN, Wait for your turn)
-        Note over GS: State unchanged - nothing broadcast
-    end
-
-    critical W1 acquires game_lock
-        W1->>GS: state PLAYER_TURN? active_player == Player_1? phase allows DRAW?
-        alt Valid move
-            W1->>GS: draw_cards(Player_1, 1 and 3), switch_turn to Player_2
-            W1-->>C1: HAND (new Player_1 cards - private)
-            par STATE_UPDATE broadcast
-                W1-->>C1: STATE_UPDATE (active Player_2, last_action DRAW)
-            and
-                W1-->>C2: STATE_UPDATE (active Player_2, last_action DRAW)
-            end
-        else Illegal action or bad payload
-            W1-->>C1: ERROR (code INVALID_ACTION or INVALID_CARD_INDEX)
-            Note over GS: State unchanged - nothing broadcast
-        end
+    S-->>C1: HAND (Player_1 cards only)
+    S-->>C2: HAND (Player_2 cards only)
+    par State broadcast
+        S-->>C1: STATE_UPDATE (BETTING_1, turn Player_1, chips 100-100)
+    and
+        S-->>C2: STATE_UPDATE (BETTING_1, turn Player_1, chips 100-100)
     end
 
-    C1->>W1: malformed bytes then LF
-    Note over W1: json parse fails outside lock
-    critical W1 holds game_lock (send only)
-        W1-->>C1: ERROR (code MALFORMED_JSON)
-    end
-
-    C2->>W2: ACTION (BET, amount 10)
-    critical W2 holds game_lock
-        W2->>GS: turn and phase valid, record bet, switch_turn to Player_1
-        par STATE_UPDATE broadcast
-            W2-->>C1: STATE_UPDATE (active Player_1, last_action BET)
+    Note over C1,C2: Turn enforcement and move validation
+    C2->>S: ACTION (CHECK)
+    Note over S: Active player is Player_1
+    S-->>C2: ERROR (OUT_OF_TURN) - state unchanged
+    C1->>S: ACTION (BET, amount 20)
+    Note over S: Check state, turn, phase, and bet within chips
+    alt Valid move
+        Note over S: Move 20 chips to the pot, turn to Player_2
+        par Broadcast before the lock is released
+            S-->>C1: STATE_UPDATE (turn Player_2, pot 20, to call 20)
         and
-            W2-->>C2: STATE_UPDATE (active Player_1, last_action BET)
+            S-->>C2: STATE_UPDATE (turn Player_2, pot 20, to call 20)
         end
+    else Illegal move or bad payload
+        S-->>C1: ERROR (INVALID_ACTION or INVALID_BET) - state unchanged
     end
 
-    Note over C1,C2: Phase 3 - Round end and score synchronization
+    Note over C1,C2: Each move below gets the same checks and a STATE_UPDATE to both clients
+    C2->>S: ACTION (CALL) - closes BETTING_1
+    C1->>S: ACTION (DRAW, cards 1 and 3)
+    S-->>C1: HAND (new Player_1 cards only)
+    C2->>S: ACTION (DRAW, keep all)
+    S-->>C2: HAND (Player_2 cards only)
+    C1->>S: ACTION (ALL_IN, 80 chips) - in BETTING_2
 
-    alt Player_1 calls
-        C1->>W1: ACTION (CALL)
-    else Player_1 folds
-        C1->>W1: ACTION (FOLD)
+    Note over C1,C2: Round over and score sync
+    alt Player_2 calls
+        C2->>S: ACTION (CALL)
+        Note over S: Showdown - better hand takes the pot
+    else Player_2 folds
+        C2->>S: ACTION (FOLD)
+        Note over S: Player_1 takes the pot
     end
-    critical W1 holds game_lock for the whole round transition
-        alt CALL
-            W1->>GS: showdown() compare hands, winner by hand rank
-        else FOLD
-            W1->>GS: winner = Player_2 (no showdown)
-        end
-        W1->>GS: record_round_win(winner) update wins and streaks
-        par ROUND_OVER broadcast with score table
-            W1-->>C1: ROUND_OVER (winner, reason, winning_hand, wins, streaks)
+    Note over S: Update chips, wins, and streaks
+    par Score broadcast
+        S-->>C1: ROUND_OVER (winner, hand, pot, chips, wins, streaks)
+    and
+        S-->>C2: ROUND_OVER (winner, hand, pot, chips, wins, streaks)
+    end
+    alt Match continues
+        S-->>C1: HAND (new Player_1 cards)
+        S-->>C2: HAND (new Player_2 cards)
+        par State broadcast
+            S-->>C1: STATE_UPDATE (round 2, chips, wins, streaks)
         and
-            W1-->>C2: ROUND_OVER (winner, reason, winning_hand, wins, streaks)
+            S-->>C2: STATE_UPDATE (round 2, chips, wins, streaks)
         end
-        W1->>GS: check_game_over()
-        alt Match continues
-            W1->>GS: next_round() round + 1, new deck, deal
-            W1-->>C1: HAND (new Player_1 cards - private)
-            W1-->>C2: HAND (new Player_2 cards - private)
-            par STATE_UPDATE broadcast
-                W1-->>C1: STATE_UPDATE (round 2, active player, wins, streaks, last_action NEW_ROUND)
-            and
-                W1-->>C2: STATE_UPDATE (round 2, active player, wins, streaks, last_action NEW_ROUND)
-            end
-        else Streak reaches 3 or round limit reached
-            par GAME_OVER broadcast
-                W1-->>C1: GAME_OVER (winner, reason THREE_CONSECUTIVE_WINS or ROUND_LIMIT_DRAW, wins)
-            and
-                W1-->>C2: GAME_OVER (winner, reason THREE_CONSECUTIVE_WINS or ROUND_LIMIT_DRAW, wins)
-            end
-            W1->>M: set game_over_event
+    else Out of chips, 3 wins in a row, or round 10 played
+        par Final result
+            S-->>C1: GAME_OVER (winner, reason, final chips and wins)
+        and
+            S-->>C2: GAME_OVER (winner, reason, final chips and wins)
         end
     end
 
-    Note over C1,C2: Phase 4 - Dropped connection, saved game, reconnect
-
-    C2--xW2: TCP FIN or reset (no DISCONNECT sent)
-    Note over W2: recv returns empty bytes, finally calls handle_disconnect
-    critical W2 holds game_lock
-        W2->>GS: players[Player_2] is sock2? yes (idempotency guard)
-        W2->>GS: players.pop(Player_2), sock2.close()
-        W2->>GS: keep all game state, reconnect_deadlines[Player_2] = now + 120 s
-        W2-->>C1: PLAYER_DISCONNECTED (player Player_2, reconnect_timeout 120)
-    end
-    Note over W2: worker thread exits
-
-    C1->>W1: ACTION (CHECK)
-    critical W1 holds game_lock
-        W1->>GS: state PLAYER_TURN? both seats filled? NO
-        W1-->>C1: ERROR (code GAME_PAUSED)
-        Note over GS: State unchanged - nothing broadcast
-    end
-
-    alt Player_2 returns within 120 s
-        C2->>M: TCP connect (accept returns sock4)
-        M->>W3: spawn Thread(handle_client, sock4)
-        C2->>W3: CONNECT (name Blake)
-        critical W3 holds game_lock
-            alt Name and IP match the held seat
-                W3->>GS: players[Player_2] = sock4, clear deadline
-                W3-->>C2: GAME_START (resumed true, your_role Player_2)
-                W3-->>C2: HAND (Player_2 cards, unchanged - private)
-                W3-->>C2: STATE_UPDATE (same round, phase, turn, pot, chips)
-                W3-->>C1: PLAYER_RECONNECTED (player Player_2)
-            else Different name or IP
-                W3-->>C2: ERROR (code RECONNECT_REJECTED)
-                W3->>C2: close sock4
-            end
-        end
+    Note over C1,C2: Mid-match drop and reconnect
+    C2--xS: Connection drops without DISCONNECT
+    Note over S: Keep all game state, hold the seat 120 s
+    S-->>C1: PLAYER_DISCONNECTED (Player_2, 120 s)
+    C1->>S: ACTION (CHECK)
+    S-->>C1: ERROR (GAME_PAUSED) - state unchanged
+    alt Same name and IP within 120 s
+        C2->>S: CONNECT (name Blake)
+        S-->>C2: GAME_START (resumed true)
+        S-->>C2: HAND (same cards)
+        S-->>C2: STATE_UPDATE (same turn, pot, and chips)
+        S-->>C1: PLAYER_RECONNECTED (Player_2)
     else Deadline passes
-        critical Main holds game_lock (expire_reconnects)
-            M->>GS: deadline passed, remove the held seat
-            M-->>C1: GAME_OVER (winner Player_1, reason FORFEIT)
-            M->>M: set game_over_event
-        end
+        S-->>C1: GAME_OVER (winner Player_1, FORFEIT)
     end
 
-    Note over C1,C2: Phase 5 - Quit (forfeit) and teardown
-
-    C1->>W1: DISCONNECT (reason QUIT)
-    critical W1 holds game_lock
-        W1->>GS: players[Player_1] is sock1? (idempotency guard)
-        alt Match still active
-            W1->>GS: players.pop(Player_1), sock1.close()
-            W1-->>C2: GAME_OVER (winner Player_2, reason FORFEIT)
-            W1->>M: set game_over_event
-        else Game already over
-            Note over W1: No-op - forfeit never awarded twice
-        end
-    end
-
-    critical Main holds game_lock (shutdown)
-        M->>GS: close remaining sockets, clear players
-    end
-    M->>C2: close sock4
-    Note over W3: recv raises OSError or returns EOF, worker exits
-    Note over M: close server_socket
+    Note over C1,C2: Deliberate quit
+    C1->>S: DISCONNECT (QUIT)
+    S-->>C2: GAME_OVER (winner Player_2, FORFEIT)
+    Note over S: Close all sockets and shut down
 ```
 
 ### 9.1 Narrative
 
-**Phase 1: connection, waiting to join, joined.** The main thread accepts each TCP connection and hands it to a new worker. The worker reads `CONNECT` and joins the player inside a short critical section, recording the name and IP as the player's identity. Client 1 gets `LOBBY_WAIT` (1 of 2) and waits. When Client 2 joins, its worker calls `start_game()` while holding `game_lock`. Each client receives its own `GAME_START`, its own private `HAND`, and the first public `STATE_UPDATE`. Because one thread holds the lock for this whole sequence, no worker can process an `ACTION` against a half-initialized game. A third client is rejected with `ERROR GAME_FULL` and disconnected, and the existing players are not affected.
+**Lobby.** Each client connects and sends `CONNECT` with a name. The server seats it and replies `LOBBY_WAIT`. When the second player joins, the server deals and sends each client its own `GAME_START` and private `HAND`, then broadcasts one `STATE_UPDATE` to both. All of this happens under one lock acquisition, so no `ACTION` can run against a half-dealt game. A third client gets `ERROR GAME_FULL` and is disconnected.
 
-**Phase 2: concurrent moves and turn enforcement.** Both clients send an `ACTION` at the same moment. Each worker parses its own frame without the lock, then both compete for `game_lock`. In the case shown, Worker 2 wins the lock. Its turn check fails (`active_player` is `Player_1`), so it sends `ERROR OUT_OF_TURN` to Client 2 only and changes nothing. Worker 1 then gets the lock and checks the state, turn, and phase:
+**Turn enforcement and validation.** Client 2 tries to act on Player 1's turn and gets `ERROR OUT_OF_TURN`. Nothing changes, so nothing is broadcast. Client 1's `BET` then goes through the full check order (Section 6): game state, turn, phase, and a bet no larger than either stack.
 
-- **Valid move:** it replaces the cards, sends the new `HAND` privately to Client 1, switches the turn, and broadcasts a single `STATE_UPDATE` snapshot to both clients before releasing the lock.
-- **Illegal move:** the `alt`/`else` branch sends `ERROR` to the mover and changes nothing.
+- **Valid move:** the server moves the chips, switches the turn, and sends the same `STATE_UPDATE` snapshot to both clients before releasing the lock.
+- **Illegal move:** the `alt`/`else` branch sends `ERROR` to the mover only, and the state stays unchanged.
 
-Malformed JSON is caught outside the lock, and the lock is taken only to send the `ERROR` without interleaving bytes with other messages. Player 2's `BET` follows the same validate, mutate, broadcast pattern.
+The rest of the round uses the same validate, mutate, and broadcast pattern. A `CALL` closes `BETTING_1`. Each player draws once and gets the new cards in a private `HAND`. Player 1 goes all in during `BETTING_2`.
 
-**Phase 3: round end and score sync.** A `CALL` leads to a showdown, while a `FOLD` gives the round to the opponent. Either way, a single critical section does the following:
+**Round over and score sync.** A `CALL` leads to a showdown, and a `FOLD` gives the pot to the opponent. In the same critical section, the server pays the pot, updates wins and streaks, and broadcasts `ROUND_OVER` with the full score table to both clients. If the match continues, it deals the next round and broadcasts a `STATE_UPDATE`. Otherwise it broadcasts `GAME_OVER` (out of chips, three wins in a row, or the round limit). Both clients get the same score table in the same order, and no move from the next round can arrive in between.
 
-- updates wins and streaks
-- broadcasts `ROUND_OVER` with the full score table to both clients
-- checks whether the match is over
+**Drop and reconnect.** If a connection closes without `DISCONNECT`, the server keeps the whole game, holds the seat for 120 s, and sends `PLAYER_DISCONNECTED` to the other client. Moves during the pause get `ERROR GAME_PAUSED`. A client that reconnects with the same name and IP gets `GAME_START {resumed: true}`, the same `HAND`, and the current `STATE_UPDATE`, and the opponent gets `PLAYER_RECONNECTED`. If the deadline passes first, the missing player forfeits.
 
-If the match continues, the worker deals the next round, sends each private `HAND`, and broadcasts `STATE_UPDATE` with the new round number and scores. If it is over, the worker broadcasts `GAME_OVER` and signals the main thread. Both clients get the same score table in the same order, and no move from the next round can arrive in between.
-
-**Phase 4: dropped connection, saved game, reconnect.** Client 2's connection closes without a `DISCONNECT`. Its worker's cleanup runs `_disconnect_locked` under the lock. The socket guard makes it idempotent, so a later failed send for the same socket does nothing. Instead of ending the match, it keeps every piece of game state, starts a 120 s reconnect deadline, and sends `PLAYER_DISCONNECTED` to Client 1. While the seat is empty, Client 1's moves get `ERROR GAME_PAUSED` and change nothing.
-
-- **Reconnect:** Client 2 connects again and sends `CONNECT` with the same name from the same IP. Its new worker matches the identity under the lock, puts the new socket in the old seat, and sends `GAME_START {resumed: true}`, the unchanged private `HAND`, and the current `STATE_UPDATE`. Client 1 gets `PLAYER_RECONNECTED`, and play continues from the same phase and turn. A connection with a different name or IP gets `RECONNECT_REJECTED`.
-- **Timeout:** if nobody reclaims the seat in time, the main thread's `expire_reconnects()` forfeits the missing player under the lock and broadcasts `GAME_OVER`.
-
-**Phase 5: quit and teardown.** `DISCONNECT {reason: QUIT}` is a deliberate exit, so it forfeits right away instead of holding the seat. The main thread then closes the remaining sockets and the listening socket, and every worker exits.
+**Quit.** `DISCONNECT {reason: QUIT}` is a deliberate exit, so the opponent wins by forfeit right away. The server then closes every socket and shuts down.
 
 ## 10. Implementation Mapping
 
