@@ -8,12 +8,16 @@ VALID_CLIENT_MESSAGES = {
     "DISCONNECT"
 }
 
+# Placeholder produced by receive_messages() for an unparseable line.
+MALFORMED = "MALFORMED"
+
 VALID_ACTIONS = {
     "CHECK",
     "BET",
     "CALL",
     "FOLD",
-    "DRAW"
+    "DRAW",
+    "ALL_IN"
 }
 
 
@@ -38,10 +42,13 @@ def send_message(sock, message):
     sock.sendall(data.encode("utf-8"))
 
 
-def receive_messages(sock, buffer=""):
+def receive_messages(sock, buffer=b""):
     """
     Receive TCP data and extract all complete newline-delimited
     JSON messages.
+
+    The buffer holds raw bytes so a multi-byte UTF-8 character
+    split across two recv() calls is decoded only once complete.
 
     Returns:
         messages  - list of complete decoded messages
@@ -55,24 +62,24 @@ def receive_messages(sock, buffer=""):
     if not data:
         return [], buffer, False
 
-    buffer += data.decode("utf-8")
+    buffer += data
 
     messages = []
 
     # There may be multiple messages in one recv()
-    while "\n" in buffer:
-        line, buffer = buffer.split("\n", 1)
+    while b"\n" in buffer:
+        line, buffer = buffer.split(b"\n", 1)
 
-        if not line:
+        if not line.strip():
             continue
 
         try:
-            message = json.loads(line)
+            message = json.loads(line.decode("utf-8"))
             messages.append(message)
 
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, UnicodeDecodeError):
             messages.append({
-                "msg_type": "INVALID"
+                "msg_type": MALFORMED
             })
 
     return messages, buffer, True
@@ -85,6 +92,9 @@ def validate_message(message):
 
     if not isinstance(message, dict):
         return False, "INVALID_SCHEMA"
+
+    if message.get("msg_type") == MALFORMED:
+        return False, "MALFORMED_JSON"
 
     required = {
         "msg_type",
@@ -131,7 +141,8 @@ def validate_action(payload):
     if action == "BET":
         amount = payload.get("amount")
 
-        if not isinstance(amount, int):
+        # bool is a subclass of int, so reject it explicitly.
+        if not isinstance(amount, int) or isinstance(amount, bool):
             return False, "INVALID_BET"
 
         if amount <= 0:
@@ -144,14 +155,15 @@ def validate_action(payload):
         if not isinstance(cards, list):
             return False, "INVALID_CARD_INDEX"
 
-        if len(cards) != len(set(cards)):
-            return False, "INVALID_CARD_INDEX"
-
         for index in cards:
-            if not isinstance(index, int):
+            if not isinstance(index, int) or isinstance(index, bool):
                 return False, "INVALID_CARD_INDEX"
 
             if index < 0 or index > 4:
                 return False, "INVALID_CARD_INDEX"
+
+        # Checked after the type loop: set() fails on unhashable items.
+        if len(cards) != len(set(cards)):
+            return False, "INVALID_CARD_INDEX"
 
     return True, None

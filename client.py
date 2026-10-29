@@ -36,6 +36,14 @@ sock = socket.socket(
 player_id = None
 running = True
 
+# Most recent STATE_UPDATE payload, used to re-prompt
+# after the server rejects a move.
+last_state = None
+
+# True after a move was rejected because the opponent
+# dropped. The turn is offered again when they return.
+paused = False
+
 
 # ---------------------------------------------------
 # CARD DISPLAY
@@ -95,112 +103,189 @@ def send_action(action, **kwargs):
 # PLAYER TURN
 # --------------------------------------------------------------
 
-def take_turn():
+def legal_choices(state):
+    """
+    Only offer actions the server will accept in this phase.
+    The server still validates everything.
+    """
+
+    if state["phase"] == "DRAW_PHASE":
+        return ["DRAW"]
+
+    current_bet = state.get("current_bet", 0)
+    all_in = state.get("all_in_amount", 0)
+
+    if current_bet > 0:
+
+        # When the opponent is already all in, ALL_IN would
+        # only match the bet, which is the same as CALL.
+        if all_in > current_bet:
+            return ["CALL", "ALL_IN", "FOLD"]
+
+        return ["CALL", "FOLD"]
+
+    return ["CHECK", "BET", "ALL_IN", "FOLD"]
+
+
+def choice_label(action, state):
+
+    if action == "ALL_IN":
+        return f"All in ({state.get('all_in_amount', 0)})"
+
+    if action == "CALL":
+        return f"Call ({state.get('current_bet', 0)})"
+
+    return action.title()
+
+
+def my_chips(state):
+
+    if player_id == "Player_1":
+        return state.get("player_1_chips")
+
+    return state.get("player_2_chips")
+
+
+def send_quit():
+
+    global running
+
+    disconnect = create_message(
+        "DISCONNECT",
+        player_id,
+        {
+            "reason": "QUIT"
+        }
+    )
+
+    send_message(
+        sock,
+        disconnect
+    )
+
+    print(
+        "You left the game."
+    )
+
+    running = False
+
+
+def take_turn(state):
+    """
+    Prompt until one action has been sent (or the player quits).
+    """
+
+    choices = legal_choices(
+        state
+    )
 
     print("\nYour turn.")
 
-    print("1. Check")
-    print("2. Bet")
-    print("3. Call")
-    print("4. Fold")
-    print("5. Draw")
-    print("Q. Quit")
+    print(
+        "Your chips:",
+        my_chips(state)
+    )
 
-    choice = input(
-        "> "
-    ).strip().lower()
-
-    # CHECK
-    if choice == "1":
-
-        send_action(
-            "CHECK"
+    if state.get("current_bet", 0) > 0:
+        print(
+            "Bet to call:",
+            state["current_bet"]
         )
 
-    # BET
-    elif choice == "2":
+    while True:
 
-        try:
+        for number, action in enumerate(choices, start=1):
+            print(f"{number}. {choice_label(action, state)}")
 
-            amount = int(
-                input(
-                    "Bet amount: "
-                )
+        print("Q. Quit (forfeits the match)")
+
+        choice = input(
+            "> "
+        ).strip().lower()
+
+        if choice == "q":
+            send_quit()
+            return
+
+        if (
+            not choice.isdigit()
+            or not 1 <= int(choice) <= len(choices)
+        ):
+            print(
+                "Invalid selection."
             )
+            continue
+
+        action = choices[int(choice) - 1]
+
+        # BET
+        if action == "BET":
+
+            max_bet = state.get("max_bet", 0)
+
+            try:
+
+                amount = int(
+                    input(
+                        f"Bet amount (1-{max_bet}): "
+                    )
+                )
+
+            except ValueError:
+
+                print(
+                    "Bet must be a number."
+                )
+                continue
+
+            if not 1 <= amount <= max_bet:
+
+                print(
+                    f"Bet must be between 1 and {max_bet}."
+                )
+                continue
 
             send_action(
                 "BET",
                 amount=amount
             )
 
-        except ValueError:
+        # DRAW
+        elif action == "DRAW":
 
-            print(
-                "Bet must be a number."
+            raw = input(
+                "Card positions to replace "
+                "(example: 0,2,4 or blank to keep all): "
             )
 
-    # CALL
-    elif choice == "3":
+            try:
 
-        send_action(
-            "CALL"
-        )
+                indexes = [
+                    int(value.strip())
+                    for value in raw.split(",")
+                    if value.strip()
+                ]
 
-    # FOLD
-    elif choice == "4":
+            except ValueError:
 
-        send_action(
-            "FOLD"
-        )
-
-    # DRAW
-    elif choice == "5":
-
-        raw = input(
-            "Card positions to replace "
-            "(example: 0,2,4): "
-        )
-
-        try:
-
-            indexes = [
-                int(value.strip())
-                for value in raw.split(",")
-                if value.strip()
-            ]
+                print(
+                    "Invalid card indexes."
+                )
+                continue
 
             send_action(
                 "DRAW",
                 cards=indexes
             )
 
-        except ValueError:
+        # CHECK, CALL, ALL_IN, FOLD
+        else:
 
-            print(
-                "Invalid card indexes."
+            send_action(
+                action
             )
 
-    # QUIT
-    elif choice == "q":
-
-        disconnect = create_message(
-            "DISCONNECT",
-            player_id,
-            {
-                "reason": "QUIT"
-            }
-        )
-
-        send_message(
-            sock,
-            disconnect
-        )
-
-    else:
-
-        print(
-            "Invalid selection."
-        )
+        return
 
 
 # ------------------------------------------------------
@@ -211,6 +296,8 @@ def handle_message(message):
 
     global player_id
     global running
+    global last_state
+    global paused
 
     msg_type = message.get(
         "msg_type"
@@ -249,7 +336,12 @@ def handle_message(message):
 
         print("\n" + SPACER)
 
-        print("GAME START")
+        if payload.get("resumed"):
+            print("GAME RESUMED")
+
+        else:
+            print("GAME START")
+
         print(SPACER)
         print("You are:",player_id)
 
@@ -261,6 +353,11 @@ def handle_message(message):
         print(
             "Maximum rounds:",
             payload["max_rounds"]
+        )
+
+        print(
+            "Starting chips:",
+            payload.get("starting_chips")
         )
 
     # ----------------------------------
@@ -299,6 +396,20 @@ def handle_message(message):
         )
 
         print(
+            "Pot:",
+            payload.get("pot", 0),
+            "| Bet to call:",
+            payload.get("current_bet", 0)
+        )
+
+        print(
+            "Chips:",
+            payload.get("player_1_chips"),
+            "-",
+            payload.get("player_2_chips")
+        )
+
+        print(
             "Last action:",
             payload.get(
                 "last_action"
@@ -319,12 +430,28 @@ def handle_message(message):
             payload["player_2_streak"]
         )
 
+        seq = payload.get("seq")
+
+        if (
+            last_state is not None
+            and seq is not None
+            and last_state.get("seq") is not None
+            and seq != last_state["seq"] + 1
+        ):
+            print(
+                "Warning: missed a state update."
+            )
+
+        last_state = payload
+
         if (
             payload["active_player"]
             == player_id
         ):
 
-            take_turn()
+            take_turn(
+                payload
+            )
 
         else:
 
@@ -370,6 +497,18 @@ def handle_message(message):
             )
 
         print(
+            "Pot:",
+            payload.get("pot", 0)
+        )
+
+        print(
+            "Chips:",
+            payload.get("player_1_chips"),
+            "-",
+            payload.get("player_2_chips")
+        )
+
+        print(
             "Score:",
             payload["player_1_wins"],
             "-",
@@ -401,6 +540,64 @@ def handle_message(message):
                 "message"
             )
         )
+
+        # The opponent dropped. Wait for PLAYER_RECONNECTED
+        # instead of asking again right away.
+        if payload.get("code") == "GAME_PAUSED":
+
+            paused = True
+
+            print(
+                "Waiting for your opponent to reconnect..."
+            )
+
+            return
+
+        # A rejected move changes nothing on the server, so
+        # no new STATE_UPDATE is coming. Ask again.
+        if (
+            last_state is not None
+            and last_state["active_player"] == player_id
+            and running
+        ):
+            take_turn(
+                last_state
+            )
+
+    # ---------------------------
+    # OPPONENT LEFT / RETURNED
+    # ------------------------------
+
+    elif msg_type == "PLAYER_DISCONNECTED":
+
+        print(
+            f"\n{payload['player']} lost connection. "
+            f"Waiting up to {payload['reconnect_timeout']}s "
+            "for them to reconnect..."
+        )
+
+    elif msg_type == "PLAYER_RECONNECTED":
+
+        print(
+            f"\n{payload['player']} reconnected."
+        )
+
+        # Offer the turn again if a move was refused while
+        # the opponent was away.
+        if (
+            paused
+            and last_state is not None
+            and last_state["active_player"] == player_id
+            and running
+        ):
+
+            paused = False
+
+            take_turn(
+                last_state
+            )
+
+        paused = False
 
     # ---------------------------
     # GAME OVER
@@ -460,6 +657,13 @@ def handle_message(message):
             payload["player_2_wins"]
         )
 
+        print(
+            "Final chips:",
+            payload.get("player_1_chips"),
+            "-",
+            payload.get("player_2_chips")
+        )
+
         running = False
 
 
@@ -471,7 +675,7 @@ def receive_loop():
 
     global running
 
-    buffer = ""
+    buffer = b""
 
     try:
 
@@ -532,6 +736,15 @@ def main():
         "===================="
     )
 
+    # Ask before connecting so the server is not left
+    # waiting for CONNECT while the player types.
+    name = input(
+        "Enter your name: "
+    ).strip()
+
+    if not name:
+        name = "Player"
+
     # Connect to server.
     try:
 
@@ -564,18 +777,13 @@ def main():
         f"{SERVER_HOST}:{PORT}"
     )
 
-    # Get player's display name.
-    name = input(
-        "Enter your name: "
-    ).strip()
-
-    if not name:
-        name = "Player"
-
     # Send CONNECT.
     connect_message = create_message(
         "CONNECT",
-        name
+        "UNASSIGNED",
+        {
+            "name": name
+        }
     )
 
     send_message(
@@ -584,14 +792,26 @@ def main():
     )
 
     # Start listening for server messages.
+    # Daemon, so Ctrl+C can exit even while the thread is
+    # waiting at an input() prompt.
     receive_thread = threading.Thread(
-        target=receive_loop
+        target=receive_loop,
+        daemon=True
     )
 
     receive_thread.start()
 
     # Wait until receive thread finishes
-    receive_thread.join()
+    try:
+        receive_thread.join()
+
+    except KeyboardInterrupt:
+
+        # Leaving without DISCONNECT keeps the match saved.
+        print(
+            "\nConnection closed. Reconnect with the same "
+            "name to resume."
+        )
 
     try:
         sock.close()
